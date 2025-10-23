@@ -1,0 +1,37 @@
+{
+  "name": "llm-agent",
+  "version": "1.0.0",
+  "description": "An A2A agent that proxies requests to Azure OpenAI LLM using LangChain",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx index.ts",
+    "dev": "tsx watch index.ts"
+  },
+  "keywords": [
+    "a2a",
+    "agent",
+    "llm",
+    "azure-openai",
+    "langchain"
+  ],
+  "dependencies": {
+    "@a2a-js/sdk": "^0.3.4",
+    "@langchain/core": "^1.0.1",
+    "@langchain/openai": "^1.0.0",
+    "express": "^5.1.0",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.13.14",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
