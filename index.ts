@@ -7,6 +7,7 @@ import {
   AgentCard,
   Task,
   TaskStatusUpdateEvent,
+  TaskArtifactUpdateEvent,
   TextPart,
   Message,
   Part,
@@ -331,9 +332,9 @@ class LLMAgentExecutor implements AgentExecutor {
         return;
       }
 
-      // 5. Call Azure OpenAI via LangChain
+      // 5. Call Azure OpenAI via LangChain (streaming)
       console.log(
-        `[LLMAgentExecutor] Sending ${langchainMessages.length} messages to Azure OpenAI`
+        `[LLMAgentExecutor] Sending ${langchainMessages.length} messages to Azure OpenAI (streaming)`
       );
       console.log(`[LLMAgentExecutor] Messages preview:`, langchainMessages.map(m => ({
         type: m.constructor.name,
@@ -341,17 +342,126 @@ class LLMAgentExecutor implements AgentExecutor {
         contentPreview: m.content.toString().substring(0, 100)
       })));
 
-      console.log(`[LLMAgentExecutor] Calling LLM with deployment: `);
-      const response = await this.llm.invoke(langchainMessages);
+      console.log(`[LLMAgentExecutor] Starting streaming LLM call...`);
+      const stream = await this.llm.stream(langchainMessages);
 
-      console.log(`[LLMAgentExecutor] LLM call successful`);
-      console.log(`[LLMAgentExecutor] Response type:`, response.constructor.name);
-      console.log(`[LLMAgentExecutor] Response content length:`, response.content.toString().length);
+      // 6. Process streaming response
+      const artifactId = uuidv4();
+      let accumulatedText = "";
+      let accumulatedResponse: AIMessage | null = null;
+      let chunkCount = 0;
 
-      // 6. Check for cancellation after LLM call
+      console.log(`[LLMAgentExecutor] Processing streaming chunks...`);
+
+      for await (const chunk of stream) {
+        // Check for cancellation during streaming
+        if (this.cancelledTasks.has(taskId)) {
+          console.log(
+            `[LLMAgentExecutor] Request cancelled during streaming for task: ${taskId}`
+          );
+          const cancelledUpdate: TaskStatusUpdateEvent = {
+            kind: "status-update",
+            taskId: taskId,
+            contextId: contextId,
+            status: {
+              state: "canceled",
+              timestamp: new Date().toISOString(),
+            },
+            final: true,
+          };
+          eventBus.publish(cancelledUpdate);
+          this.cancelledTasks.delete(taskId);
+          return;
+        }
+
+        chunkCount++;
+        const chunkText = chunk.content.toString();
+        accumulatedText += chunkText;
+
+        // Accumulate the full response (for metadata extraction later)
+        if (!accumulatedResponse) {
+          accumulatedResponse = chunk;
+        } else {
+          // Merge chunk data into accumulated response
+          accumulatedResponse.content = accumulatedText;
+          if (chunk.response_metadata) {
+            accumulatedResponse.response_metadata = chunk.response_metadata;
+          }
+          if (chunk.tool_calls && chunk.tool_calls.length > 0) {
+            accumulatedResponse.tool_calls = [
+              ...(accumulatedResponse.tool_calls || []),
+              ...chunk.tool_calls
+            ];
+          }
+        }
+
+        // Send incremental update to client
+        if (chunkText.trim()) {
+          const artifactUpdate: TaskArtifactUpdateEvent = {
+            kind: "artifact-update",
+            taskId: taskId,
+            contextId: contextId,
+            artifact: {
+              artifactId: artifactId,
+              name: "streaming_response",
+              parts: [
+                {
+                  kind: "text",
+                  text: chunkText,
+                },
+              ],
+            },
+            append: true, // Append to existing artifact
+            lastChunk: false, // Will be set to true for the last chunk
+          };
+          eventBus.publish(artifactUpdate);
+
+          // Log every artifact update sent
+          const preview = chunkText.length > 50 ? chunkText.substring(0, 50) + "..." : chunkText;
+          console.log(
+            `[LLMAgentExecutor] 📤 Sent artifact update #${chunkCount}: "${preview}" (artifact: ${artifactId.substring(0, 8)}...)`
+          );
+
+          if (chunkCount % 5 === 0) {
+            console.log(
+              `[LLMAgentExecutor] Streamed ${chunkCount} chunks, ${accumulatedText.length} chars so far...`
+            );
+          }
+        }
+      }
+
+      console.log(
+        `[LLMAgentExecutor] Streaming complete: ${chunkCount} chunks, ${accumulatedText.length} total chars`
+      );
+
+      // 7. Send final chunk marker
+      const finalArtifactUpdate: TaskArtifactUpdateEvent = {
+        kind: "artifact-update",
+        taskId: taskId,
+        contextId: contextId,
+        artifact: {
+          artifactId: artifactId,
+          name: "streaming_response",
+          parts: [
+            {
+              kind: "text",
+              text: "", // Empty text for the final marker
+            },
+          ],
+        },
+        append: false,
+        lastChunk: true, // Mark as final chunk
+      };
+      eventBus.publish(finalArtifactUpdate);
+
+      console.log(
+        `[LLMAgentExecutor] 📤 Sent final artifact marker (lastChunk: true, artifact: ${artifactId.substring(0, 8)}...)`
+      );
+
+      // 8. Check for cancellation after streaming
       if (this.cancelledTasks.has(taskId)) {
         console.log(
-          `[LLMAgentExecutor] Request cancelled after LLM call for task: ${taskId}`
+          `[LLMAgentExecutor] Request cancelled after streaming for task: ${taskId}`
         );
         const cancelledUpdate: TaskStatusUpdateEvent = {
           kind: "status-update",
@@ -368,16 +478,19 @@ class LLMAgentExecutor implements AgentExecutor {
         return;
       }
 
-      // 7. Parse the LLM response into structured parts
-      const responseParts = parseAIMessageToParts(response);
+      // 9. Parse the complete response into structured parts
+      const responseParts = accumulatedResponse
+        ? parseAIMessageToParts(accumulatedResponse)
+        : [{ kind: "text" as const, text: accumulatedText }];
+
       console.log(
-        `[LLMAgentExecutor] Received response from Azure OpenAI with ${responseParts.length} part(s)`
+        `[LLMAgentExecutor] Complete response has ${responseParts.length} part(s)`
       );
       console.log(
         `[LLMAgentExecutor] Part types: ${responseParts.map(p => p.kind).join(", ")}`
       );
 
-      // 8. Create agent message with all structured parts
+      // 10. Create agent message with all structured parts
       const agentMessage: Message = {
         kind: "message",
         role: "agent",
@@ -389,20 +502,20 @@ class LLMAgentExecutor implements AgentExecutor {
 
       // Log the complete message being sent to client
       console.log(
-        `[LLMAgentExecutor] ========== AGENT MESSAGE TO CLIENT ==========`
+        `[LLMAgentExecutor] ========== FINAL AGENT MESSAGE TO CLIENT ==========`
       );
       console.log(
         `[LLMAgentExecutor] Complete message structure:`
       );
       console.log(JSON.stringify(agentMessage, null, 2));
       console.log(
-        `[LLMAgentExecutor] ===============================================`
+        `[LLMAgentExecutor] ======================================================`
       );
 
       historyForLLM.push(agentMessage);
       contexts.set(contextId, historyForLLM);
 
-      // 9. Publish final task status update
+      // 11. Publish final task status update
       const finalUpdate: TaskStatusUpdateEvent = {
         kind: "status-update",
         taskId: taskId,
@@ -417,7 +530,7 @@ class LLMAgentExecutor implements AgentExecutor {
       eventBus.publish(finalUpdate);
 
       console.log(
-        `[LLMAgentExecutor] Task ${taskId} completed successfully`
+        `[LLMAgentExecutor] Task ${taskId} completed successfully with streaming`
       );
     } catch (error: any) {
       console.error(`[LLMAgentExecutor] ========== ERROR DETAILS ==========`);
