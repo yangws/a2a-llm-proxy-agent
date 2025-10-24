@@ -1,17 +1,15 @@
 import express from "express";
 import { v4 as uuidv4 } from "uuid";
 import { AzureChatOpenAI } from "@langchain/openai";
-import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
+import { AIMessage, BaseMessage } from "@langchain/core/messages";
+import { a2aMessagesToLangChain, langChainAIMessageToA2A } from "./src/converter.js";
 
 import {
   AgentCard,
   Task,
   TaskStatusUpdateEvent,
   TaskArtifactUpdateEvent,
-  TextPart,
   Message,
-  Part,
-  DataPart,
 } from "@a2a-js/sdk";
 import {
   InMemoryTaskStore,
@@ -39,122 +37,6 @@ for (const envVar of requiredEnvVars) {
 
 // Simple store for conversation contexts
 const contexts: Map<string, Message[]> = new Map();
-
-/**
- * Parses an AIMessage from LangChain into A2A Part objects.
- * Extracts text content, tool calls, and metadata into structured parts.
- *
- * @param aiMessage - The AIMessage from LangChain
- * @returns Array of A2A Part objects
- */
-function parseAIMessageToParts(aiMessage: AIMessage): Part[] {
-  const parts: Part[] = [];
-
-  // 1. Extract text content
-  let textContent = "";
-  if (typeof aiMessage.content === "string") {
-    textContent = aiMessage.content;
-  } else if (Array.isArray(aiMessage.content)) {
-    // Content can be an array of content blocks
-    for (const block of aiMessage.content) {
-      if (typeof block === "string") {
-        textContent += block;
-      } else if (block && typeof block === "object") {
-        // Handle structured content blocks
-        if ("text" in block && typeof block.text === "string") {
-          textContent += block.text;
-        } else if ("type" in block && block.type === "text" && "text" in block) {
-          textContent += block.text;
-        }
-      }
-    }
-  }
-
-  // Always add text part if there's any text content
-  if (textContent.trim()) {
-    const textPart: TextPart = {
-      kind: "text",
-      text: textContent,
-    };
-    parts.push(textPart);
-  }
-
-  // 2. Extract tool calls if present
-  if (aiMessage.tool_calls && aiMessage.tool_calls.length > 0) {
-    const toolCallsPart: DataPart = {
-      kind: "data",
-      data: {
-        type: "tool_calls",
-        tool_calls: aiMessage.tool_calls,
-      },
-      metadata: {
-        description: "Tool calls requested by the LLM",
-      },
-    };
-    parts.push(toolCallsPart);
-  }
-
-  // 3. Extract additional kwargs if present (may contain function calls, etc.)
-  if (aiMessage.additional_kwargs && Object.keys(aiMessage.additional_kwargs).length > 0) {
-    // Check for function_call (older OpenAI format)
-    if ("function_call" in aiMessage.additional_kwargs && aiMessage.additional_kwargs.function_call) {
-      const functionCallPart: DataPart = {
-        kind: "data",
-        data: {
-          type: "function_call",
-          function_call: aiMessage.additional_kwargs.function_call,
-        },
-        metadata: {
-          description: "Function call requested by the LLM",
-        },
-      };
-      parts.push(functionCallPart);
-    }
-
-    // Include other additional_kwargs as a separate data part if they exist
-    const otherKwargs = { ...aiMessage.additional_kwargs };
-    delete (otherKwargs as any).function_call;
-
-    if (Object.keys(otherKwargs).length > 0) {
-      const additionalDataPart: DataPart = {
-        kind: "data",
-        data: {
-          type: "additional_data",
-          ...otherKwargs,
-        },
-        metadata: {
-          description: "Additional data from LLM response",
-        },
-      };
-      parts.push(additionalDataPart);
-    }
-  }
-
-  // 4. Extract response metadata if present and meaningful
-  if (aiMessage.response_metadata && Object.keys(aiMessage.response_metadata).length > 0) {
-    const metadataPart: DataPart = {
-      kind: "data",
-      data: {
-        type: "response_metadata",
-        ...aiMessage.response_metadata,
-      },
-      metadata: {
-        description: "Metadata from LLM response (model info, tokens, etc.)",
-      },
-    };
-    parts.push(metadataPart);
-  }
-
-  // If no parts were created, add a default empty text part
-  if (parts.length === 0) {
-    parts.push({
-      kind: "text",
-      text: "[No content received from LLM]",
-    });
-  }
-
-  return parts;
-}
 
 /**
  * LLMAgentExecutor implements the agent's core logic.
@@ -268,22 +150,8 @@ class LLMAgentExecutor implements AgentExecutor {
     }
     contexts.set(contextId, historyForLLM);
 
-    // Convert A2A messages to LangChain messages
-    const langchainMessages: BaseMessage[] = [];
-    for (const m of historyForLLM) {
-      const textParts = m.parts.filter(
-        (p): p is TextPart => p.kind === "text" && !!(p as TextPart).text
-      );
-      const textContent = textParts.map((p) => (p as TextPart).text).join("\n");
-
-      if (!textContent) continue;
-
-      if (m.role === "user") {
-        langchainMessages.push(new HumanMessage(textContent));
-      } else if (m.role === "agent") {
-        langchainMessages.push(new AIMessage(textContent));
-      }
-    }
+    // Convert A2A messages to LangChain messages using the converter
+    const langchainMessages: BaseMessage[] = a2aMessagesToLangChain(historyForLLM);
 
     if (langchainMessages.length === 0) {
       console.warn(
@@ -478,29 +346,32 @@ class LLMAgentExecutor implements AgentExecutor {
         return;
       }
 
-      // 9. Parse the complete response into structured parts
-      const responseParts = accumulatedResponse
-        ? parseAIMessageToParts(accumulatedResponse)
-        : [{ kind: "text" as const, text: accumulatedText }];
+      // 9. Convert the complete LangChain AIMessage to A2A Message format
+      // This embeds the full AIMessage (with tool_calls, etc.) into a DataPart
+      const agentMessage: Message = accumulatedResponse
+        ? langChainAIMessageToA2A(
+            accumulatedResponse,
+            uuidv4(),
+            taskId,
+            contextId
+          )
+        : {
+            kind: "message",
+            role: "agent",
+            messageId: uuidv4(),
+            parts: [{ kind: "text" as const, text: accumulatedText }],
+            taskId: taskId,
+            contextId: contextId,
+          };
 
       console.log(
-        `[LLMAgentExecutor] Complete response has ${responseParts.length} part(s)`
+        `[LLMAgentExecutor] Complete response has ${agentMessage.parts.length} part(s)`
       );
       console.log(
-        `[LLMAgentExecutor] Part types: ${responseParts.map(p => p.kind).join(", ")}`
+        `[LLMAgentExecutor] Part types: ${agentMessage.parts.map(p => p.kind).join(", ")}`
       );
 
-      // 10. Create agent message with all structured parts
-      const agentMessage: Message = {
-        kind: "message",
-        role: "agent",
-        messageId: uuidv4(),
-        parts: responseParts,
-        taskId: taskId,
-        contextId: contextId,
-      };
-
-      // Log the complete message being sent to client
+      // 10. Log the complete message being sent to client
       console.log(
         `[LLMAgentExecutor] ========== FINAL AGENT MESSAGE TO CLIENT ==========`
       );
