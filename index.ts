@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import { AzureChatOpenAI } from "@langchain/openai";
 import { AIMessage, BaseMessage } from "@langchain/core/messages";
 import { a2aMessagesToLangChain, langChainAIMessageToA2A } from "./src/converter.js";
+import { extractToolsFromMessage, convertToolsForLangChain } from "./src/tools.js";
 
 import {
   AgentCard,
@@ -59,7 +60,7 @@ class LLMAgentExecutor implements AgentExecutor {
       azureOpenAIApiKey: process.env.AZURE_OPENAI_API_KEY,
       azureOpenAIApiInstanceName: process.env.AZURE_RESOURCE_NAME,
       // azureOpenAIApiDeploymentName: "Gpt-4o",
-      azureOpenAIApiDeploymentName: "Gpt-4.1",
+      azureOpenAIApiDeploymentName: "Gpt-5-codex",
       azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION,
       temperature: 0.7,
       maxTokens: 2000,
@@ -100,6 +101,19 @@ class LLMAgentExecutor implements AgentExecutor {
     console.log(
       `[LLMAgentExecutor] Processing message ${userMessage.messageId} for task ${taskId} (context: ${contextId})`
     );
+
+    // ========== Extract tool definitions from message ==========
+    const toolDefinitions = extractToolsFromMessage(userMessage);
+
+    if (toolDefinitions.length > 0) {
+      console.log(
+        `[LLMAgentExecutor] 📦 Extracted ${toolDefinitions.length} tool(s):`,
+        toolDefinitions.map(t => t.function.name).join(", ")
+      );
+    } else {
+      console.log("[LLMAgentExecutor] No tools provided in this message");
+    }
+    // ==========================================================
 
     // 1. Publish initial Task event if it's a new task
     if (!existingTask) {
@@ -200,6 +214,25 @@ class LLMAgentExecutor implements AgentExecutor {
         return;
       }
 
+      // ========== Dynamically bind tools to LLM if provided ==========
+      let llmToUse: AzureChatOpenAI | any = this.llm;
+
+      if (toolDefinitions.length > 0) {
+        const langchainTools = convertToolsForLangChain(toolDefinitions);
+        // Use bindTools method for LangChain chat models
+        llmToUse = this.llm.bindTools(langchainTools) as any;
+
+        console.log(
+          `[LLMAgentExecutor] 🔧 Bound ${toolDefinitions.length} tool(s) to LLM:`
+        );
+        toolDefinitions.forEach((tool, index) => {
+          console.log(
+            `[LLMAgentExecutor]   ${index + 1}. ${tool.function.name} - ${tool.function.description}`
+          );
+        });
+      }
+      // ===============================================================
+
       // 5. Call Azure OpenAI via LangChain (streaming)
       console.log(
         `[LLMAgentExecutor] Sending ${langchainMessages.length} messages to Azure OpenAI (streaming)`
@@ -211,7 +244,7 @@ class LLMAgentExecutor implements AgentExecutor {
       })));
 
       console.log(`[LLMAgentExecutor] Starting streaming LLM call...`);
-      const stream = await this.llm.stream(langchainMessages);
+      const stream = await llmToUse.stream(langchainMessages);
 
       // 6. Process streaming response
       const artifactId = uuidv4();
@@ -350,19 +383,19 @@ class LLMAgentExecutor implements AgentExecutor {
       // This embeds the full AIMessage (with tool_calls, etc.) into a DataPart
       const agentMessage: Message = accumulatedResponse
         ? langChainAIMessageToA2A(
-            accumulatedResponse,
-            uuidv4(),
-            taskId,
-            contextId
-          )
+          accumulatedResponse,
+          uuidv4(),
+          taskId,
+          contextId
+        )
         : {
-            kind: "message",
-            role: "agent",
-            messageId: uuidv4(),
-            parts: [{ kind: "text" as const, text: accumulatedText }],
-            taskId: taskId,
-            contextId: contextId,
-          };
+          kind: "message",
+          role: "agent",
+          messageId: uuidv4(),
+          parts: [{ kind: "text" as const, text: accumulatedText }],
+          taskId: taskId,
+          contextId: contextId,
+        };
 
       console.log(
         `[LLMAgentExecutor] Complete response has ${agentMessage.parts.length} part(s)`
