@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import { AzureChatOpenAI } from "@langchain/openai";
 import { AIMessage, BaseMessage } from "@langchain/core/messages";
 import { a2aMessagesToLangChain, langChainAIMessageToA2A } from "./src/converter.js";
-import { extractToolsFromMessage, convertToolsForLangChain } from "./src/tools.js";
+import { extractToolsFromMessage } from "./src/tools.js";
 
 import {
   AgentCard,
@@ -62,8 +62,8 @@ class LLMAgentExecutor implements AgentExecutor {
     // You can check available deployments in Azure Portal:
     // Azure OpenAI Studio > Deployments
 
-    // Option 1: Use GPT-4o with reasoning mode
-    this.deploymentName = "Gpt-4o";
+    // Option 1: Use GPT-5 with reasoning mode
+    this.deploymentName = "Gpt-5";
     this.useReasoningMode = true; // Enable reasoning mode for better responses
 
     // Option 2: Use standard GPT-4o without reasoning
@@ -90,16 +90,16 @@ class LLMAgentExecutor implements AgentExecutor {
       azureOpenAIApiInstanceName: process.env.AZURE_RESOURCE_NAME,
       azureOpenAIApiDeploymentName: this.deploymentName,
       azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION,
-      temperature: 0.7,
+      temperature: 1,
     };
 
     // Add reasoning mode parameters if enabled
     if (this.useReasoningMode) {
       console.log("  ✓ Reasoning mode enabled (using higher token limits)");
       // Note: Azure OpenAI does not support "reasoning_effort" parameter
-      // Reasoning capabilities are inherent to the model (GPT-4o)
+      // Reasoning capabilities are inherent to the model (GPT-5)
       // We just increase token limits to allow for more detailed responses
-      config.maxTokens = 4000; // Higher token limit for more detailed responses
+      // config.maxTokens = 4000; // Higher token limit for more detailed responses
     } else {
       config.maxTokens = 2000;
     }
@@ -146,17 +146,14 @@ class LLMAgentExecutor implements AgentExecutor {
     let llmToUse: AzureChatOpenAI | any = this.llm;
 
     if (toolDefinitions.length > 0) {
-      const langchainTools = convertToolsForLangChain(toolDefinitions);
-      llmToUse = this.llm.bindTools(langchainTools) as any;
+      // 直接使用工具定义，无需转换（客户端已发送标准格式）
+      llmToUse = this.llm.bindTools(toolDefinitions) as any;
 
       console.log(
-        `[LLMAgentExecutor] 🔧 Bound ${toolDefinitions.length} tool(s) to LLM:`
+        `[LLMAgentExecutor] 🔧 Binding ${toolDefinitions.length} tool(s) to LLM:`
       );
-      toolDefinitions.forEach((tool, index) => {
-        console.log(
-          `[LLMAgentExecutor]   ${index + 1}. ${tool.function.name} - ${tool.function.description}`
-        );
-      });
+      console.log("[LLMAgentExecutor] Tool definitions being bound:");
+      console.log(JSON.stringify(toolDefinitions, null, 2));
     }
 
     const stream = await llmToUse.stream(langchainMessages);
