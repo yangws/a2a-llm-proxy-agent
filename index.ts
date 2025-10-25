@@ -47,6 +47,8 @@ const contexts: Map<string, Message[]> = new Map();
 class LLMAgentExecutor implements AgentExecutor {
   private cancelledTasks = new Set<string>();
   private llm: AzureChatOpenAI;
+  private deploymentName: string;
+  private useReasoningMode: boolean;
 
   constructor() {
     // Log environment variables for debugging
@@ -55,18 +57,54 @@ class LLMAgentExecutor implements AgentExecutor {
     console.log("  AZURE_RESOURCE_NAME:", process.env.AZURE_RESOURCE_NAME);
     console.log("  AZURE_OPENAI_API_VERSION:", process.env.AZURE_OPENAI_API_VERSION);
 
-    // Prepare configuration object
-    const config = {
+    // Determine deployment name and reasoning mode
+    // IMPORTANT: Make sure this deployment exists in your Azure OpenAI resource!
+    // You can check available deployments in Azure Portal:
+    // Azure OpenAI Studio > Deployments
+
+    // Option 1: Use GPT-4o with reasoning mode
+    this.deploymentName = "Gpt-4o";
+    this.useReasoningMode = true; // Enable reasoning mode for better responses
+
+    // Option 2: Use standard GPT-4o without reasoning
+    // this.deploymentName = "Gpt-4o";
+    // this.useReasoningMode = false;
+
+    // Option 3: Use GPT-5-codex (if available in your Azure resource)
+    // this.deploymentName = "Gpt-5-codex";
+    // this.useReasoningMode = true;
+
+    console.log("[LLMAgentExecutor] ⚠️  IMPORTANT: Verify that deployment '" + this.deploymentName + "' exists in your Azure OpenAI resource!");
+
+    // Check API version
+    const apiVersion = process.env.AZURE_OPENAI_API_VERSION || "";
+
+    console.log("[LLMAgentExecutor] Configuration:");
+    console.log("  Deployment name:", this.deploymentName);
+    console.log("  API Version:", apiVersion);
+    console.log("  Reasoning mode enabled:", this.useReasoningMode);
+
+    // Prepare LangChain configuration
+    const config: any = {
       azureOpenAIApiKey: process.env.AZURE_OPENAI_API_KEY,
       azureOpenAIApiInstanceName: process.env.AZURE_RESOURCE_NAME,
-      // azureOpenAIApiDeploymentName: "Gpt-4o",
-      azureOpenAIApiDeploymentName: "Gpt-5-codex",
+      azureOpenAIApiDeploymentName: this.deploymentName,
       azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION,
       temperature: 0.7,
-      maxTokens: 2000,
     };
 
-    console.log("[LLMAgentExecutor] Initializing AzureChatOpenAI with config:");
+    // Add reasoning mode parameters if enabled
+    if (this.useReasoningMode) {
+      console.log("  ✓ Reasoning mode enabled (using higher token limits)");
+      // Note: Azure OpenAI does not support "reasoning_effort" parameter
+      // Reasoning capabilities are inherent to the model (GPT-4o)
+      // We just increase token limits to allow for more detailed responses
+      config.maxTokens = 4000; // Higher token limit for more detailed responses
+    } else {
+      config.maxTokens = 2000;
+    }
+
+    console.log("[LLMAgentExecutor] Initializing LangChain Azure OpenAI client:");
     console.log("  azureOpenAIApiKey:", config.azureOpenAIApiKey ? "***set***" : "NOT SET");
     console.log("  azureOpenAIApiInstanceName:", config.azureOpenAIApiInstanceName);
     console.log("  azureOpenAIApiDeploymentName:", config.azureOpenAIApiDeploymentName);
@@ -74,10 +112,11 @@ class LLMAgentExecutor implements AgentExecutor {
     console.log("  temperature:", config.temperature);
     console.log("  maxTokens:", config.maxTokens);
 
-    // Initialize Azure OpenAI client using LangChain
+    // Initialize LangChain client (uses Chat Completions API)
     this.llm = new AzureChatOpenAI(config);
 
-    console.log("[LLMAgentExecutor] AzureChatOpenAI initialized successfully");
+    console.log("[LLMAgentExecutor] Client initialized successfully");
+    console.log("[LLMAgentExecutor] Will use Chat Completions API:", `/openai/deployments/${this.deploymentName}/chat/completions`);
   }
 
   public cancelTask = async (
@@ -88,6 +127,110 @@ class LLMAgentExecutor implements AgentExecutor {
     console.log(`[LLMAgentExecutor] Task ${taskId} marked for cancellation`);
     // The execute loop is responsible for publishing the final state
   };
+
+
+  /**
+   * Stream response using LangChain Chat Completions API (for gpt-4o and standard models)
+   */
+  private async streamWithChatCompletions(
+    langchainMessages: BaseMessage[],
+    taskId: string,
+    contextId: string,
+    eventBus: ExecutionEventBus,
+    artifactId: string,
+    toolDefinitions: any[]
+  ): Promise<{ text: string; response: AIMessage | null }> {
+    console.log(`[LLMAgentExecutor] Using Chat Completions API (LangChain) for streaming...`);
+
+    // Bind tools if provided
+    let llmToUse: AzureChatOpenAI | any = this.llm;
+
+    if (toolDefinitions.length > 0) {
+      const langchainTools = convertToolsForLangChain(toolDefinitions);
+      llmToUse = this.llm.bindTools(langchainTools) as any;
+
+      console.log(
+        `[LLMAgentExecutor] 🔧 Bound ${toolDefinitions.length} tool(s) to LLM:`
+      );
+      toolDefinitions.forEach((tool, index) => {
+        console.log(
+          `[LLMAgentExecutor]   ${index + 1}. ${tool.function.name} - ${tool.function.description}`
+        );
+      });
+    }
+
+    const stream = await llmToUse.stream(langchainMessages);
+
+    let accumulatedText = "";
+    let accumulatedResponse: AIMessage | null = null;
+    let chunkCount = 0;
+
+    console.log(`[LLMAgentExecutor] Processing Chat Completions streaming chunks...`);
+
+    for await (const chunk of stream) {
+      // Check for cancellation
+      if (this.cancelledTasks.has(taskId)) {
+        console.log(
+          `[LLMAgentExecutor] Request cancelled during streaming for task: ${taskId}`
+        );
+        throw new Error("Task cancelled");
+      }
+
+      chunkCount++;
+      const chunkText = chunk.content.toString();
+      accumulatedText += chunkText;
+
+      // Accumulate the full response
+      if (!accumulatedResponse) {
+        accumulatedResponse = chunk;
+      } else {
+        accumulatedResponse.content = accumulatedText;
+        if (chunk.response_metadata) {
+          accumulatedResponse.response_metadata = chunk.response_metadata;
+        }
+        if (chunk.tool_calls && chunk.tool_calls.length > 0) {
+          accumulatedResponse.tool_calls = [
+            ...(accumulatedResponse.tool_calls || []),
+            ...chunk.tool_calls
+          ];
+        }
+      }
+
+      // Send incremental update to client
+      if (chunkText.trim()) {
+        const artifactUpdate: TaskArtifactUpdateEvent = {
+          kind: "artifact-update",
+          taskId: taskId,
+          contextId: contextId,
+          artifact: {
+            artifactId: artifactId,
+            name: "streaming_response",
+            parts: [{ kind: "text", text: chunkText }],
+          },
+          append: true,
+          lastChunk: false,
+        };
+        eventBus.publish(artifactUpdate);
+
+        const preview = chunkText.length > 50 ? chunkText.substring(0, 50) + "..." : chunkText;
+        console.log(
+          `[LLMAgentExecutor] 📤 Sent artifact update #${chunkCount}: "${preview}" (artifact: ${artifactId.substring(0, 8)}...)`
+        );
+
+        if (chunkCount % 5 === 0) {
+          console.log(
+            `[LLMAgentExecutor] Streamed ${chunkCount} chunks, ${accumulatedText.length} chars so far...`
+          );
+        }
+      }
+    }
+
+    console.log(
+      `[LLMAgentExecutor] Chat Completions streaming complete: ${chunkCount} chunks, ${accumulatedText.length} total chars`
+    );
+
+    return { text: accumulatedText, response: accumulatedResponse };
+  }
 
   async execute(
     requestContext: RequestContext,
@@ -214,126 +357,59 @@ class LLMAgentExecutor implements AgentExecutor {
         return;
       }
 
-      // ========== Dynamically bind tools to LLM if provided ==========
-      let llmToUse: AzureChatOpenAI | any = this.llm;
+      // 5. Call Azure OpenAI via Chat Completions API (streaming)
+      const artifactId = uuidv4();
+      let accumulatedText = "";
+      let accumulatedResponse: AIMessage | null = null;
 
-      if (toolDefinitions.length > 0) {
-        const langchainTools = convertToolsForLangChain(toolDefinitions);
-        // Use bindTools method for LangChain chat models
-        llmToUse = this.llm.bindTools(langchainTools) as any;
-
-        console.log(
-          `[LLMAgentExecutor] 🔧 Bound ${toolDefinitions.length} tool(s) to LLM:`
-        );
-        toolDefinitions.forEach((tool, index) => {
-          console.log(
-            `[LLMAgentExecutor]   ${index + 1}. ${tool.function.name} - ${tool.function.description}`
-          );
-        });
-      }
-      // ===============================================================
-
-      // 5. Call Azure OpenAI via LangChain (streaming)
       console.log(
-        `[LLMAgentExecutor] Sending ${langchainMessages.length} messages to Azure OpenAI (streaming)`
+        `[LLMAgentExecutor] Sending ${langchainMessages.length} messages to Azure OpenAI Chat Completions API`
       );
+      console.log(`[LLMAgentExecutor] Reasoning mode:`, this.useReasoningMode ? "enabled" : "disabled");
       console.log(`[LLMAgentExecutor] Messages preview:`, langchainMessages.map(m => ({
         type: m.constructor.name,
         contentLength: m.content.toString().length,
         contentPreview: m.content.toString().substring(0, 100)
       })));
 
-      console.log(`[LLMAgentExecutor] Starting streaming LLM call...`);
-      const stream = await llmToUse.stream(langchainMessages);
-
-      // 6. Process streaming response
-      const artifactId = uuidv4();
-      let accumulatedText = "";
-      let accumulatedResponse: AIMessage | null = null;
-      let chunkCount = 0;
-
-      console.log(`[LLMAgentExecutor] Processing streaming chunks...`);
-
-      for await (const chunk of stream) {
-        // Check for cancellation during streaming
-        if (this.cancelledTasks.has(taskId)) {
-          console.log(
-            `[LLMAgentExecutor] Request cancelled during streaming for task: ${taskId}`
-          );
-          const cancelledUpdate: TaskStatusUpdateEvent = {
-            kind: "status-update",
-            taskId: taskId,
-            contextId: contextId,
-            status: {
-              state: "canceled",
-              timestamp: new Date().toISOString(),
-            },
-            final: true,
-          };
-          eventBus.publish(cancelledUpdate);
-          this.cancelledTasks.delete(taskId);
-          return;
-        }
-
-        chunkCount++;
-        const chunkText = chunk.content.toString();
-        accumulatedText += chunkText;
-
-        // Accumulate the full response (for metadata extraction later)
-        if (!accumulatedResponse) {
-          accumulatedResponse = chunk;
-        } else {
-          // Merge chunk data into accumulated response
-          accumulatedResponse.content = accumulatedText;
-          if (chunk.response_metadata) {
-            accumulatedResponse.response_metadata = chunk.response_metadata;
-          }
-          if (chunk.tool_calls && chunk.tool_calls.length > 0) {
-            accumulatedResponse.tool_calls = [
-              ...(accumulatedResponse.tool_calls || []),
-              ...chunk.tool_calls
-            ];
-          }
-        }
-
-        // Send incremental update to client
-        if (chunkText.trim()) {
-          const artifactUpdate: TaskArtifactUpdateEvent = {
-            kind: "artifact-update",
-            taskId: taskId,
-            contextId: contextId,
-            artifact: {
-              artifactId: artifactId,
-              name: "streaming_response",
-              parts: [
-                {
-                  kind: "text",
-                  text: chunkText,
-                },
-              ],
-            },
-            append: true, // Append to existing artifact
-            lastChunk: false, // Will be set to true for the last chunk
-          };
-          eventBus.publish(artifactUpdate);
-
-          // Log every artifact update sent
-          const preview = chunkText.length > 50 ? chunkText.substring(0, 50) + "..." : chunkText;
-          console.log(
-            `[LLMAgentExecutor] 📤 Sent artifact update #${chunkCount}: "${preview}" (artifact: ${artifactId.substring(0, 8)}...)`
-          );
-
-          if (chunkCount % 5 === 0) {
-            console.log(
-              `[LLMAgentExecutor] Streamed ${chunkCount} chunks, ${accumulatedText.length} chars so far...`
-            );
-          }
-        }
-      }
-
-      console.log(
-        `[LLMAgentExecutor] Streaming complete: ${chunkCount} chunks, ${accumulatedText.length} total chars`
+      // Use Chat Completions API for all models
+      const result = await this.streamWithChatCompletions(
+        langchainMessages,
+        taskId,
+        contextId,
+        eventBus,
+        artifactId,
+        toolDefinitions
       );
+
+      accumulatedText = result.text;
+      accumulatedResponse = result.response;
+
+      // 6. Log the complete AIMessage received from LLM
+      if (accumulatedResponse) {
+        console.log(`[LLMAgentExecutor] ========== COMPLETE AI MESSAGE FROM LLM ==========`);
+        console.log(`[LLMAgentExecutor] Message type:`, accumulatedResponse.constructor.name);
+        console.log(`[LLMAgentExecutor] Content length:`, accumulatedResponse.content.toString().length, "chars");
+        console.log(`[LLMAgentExecutor] Content:`, accumulatedResponse.content.toString());
+
+        if (accumulatedResponse.tool_calls && accumulatedResponse.tool_calls.length > 0) {
+          console.log(`[LLMAgentExecutor] Tool calls (${accumulatedResponse.tool_calls.length}):`);
+          accumulatedResponse.tool_calls.forEach((tc, index) => {
+            console.log(`[LLMAgentExecutor]   ${index + 1}. ${tc.name}:`, JSON.stringify(tc.args));
+          });
+        } else {
+          console.log(`[LLMAgentExecutor] Tool calls: none`);
+        }
+
+        if (accumulatedResponse.response_metadata) {
+          console.log(`[LLMAgentExecutor] Response metadata:`, JSON.stringify(accumulatedResponse.response_metadata, null, 2));
+        }
+
+        console.log(`[LLMAgentExecutor] Full AIMessage object:`, JSON.stringify(accumulatedResponse, null, 2));
+        console.log(`[LLMAgentExecutor] =================================================`);
+      } else {
+        console.log(`[LLMAgentExecutor] No AIMessage received from LLM (accumulatedResponse is null)`);
+      }
 
       // 7. Send final chunk marker
       const finalArtifactUpdate: TaskArtifactUpdateEvent = {
@@ -506,7 +582,7 @@ class LLMAgentExecutor implements AgentExecutor {
 const llmAgentCard: AgentCard = {
   name: "LLM Proxy Agent",
   description:
-    "An A2A agent that acts as a proxy to Azure OpenAI GPT-4. It forwards user messages to the LLM and returns responses.",
+    "An A2A agent that acts as a proxy to Azure OpenAI GPT Model. It forwards user messages to the LLM and returns responses.",
   url: "http://localhost:41242/",
   provider: {
     organization: "A2A Samples",
