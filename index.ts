@@ -1,7 +1,7 @@
 import express from "express";
 import { v4 as uuidv4 } from "uuid";
 import { AzureChatOpenAI } from "@langchain/openai";
-import { AIMessage, BaseMessage } from "@langchain/core/messages";
+import { AIMessage, BaseMessage, AIMessageChunk } from "@langchain/core/messages";
 import { a2aMessagesToLangChain, langChainAIMessageToA2A } from "./src/converter.js";
 import { extractToolsFromMessage } from "./src/tools.js";
 
@@ -160,6 +160,7 @@ class LLMAgentExecutor implements AgentExecutor {
 
     let accumulatedText = "";
     let accumulatedResponse: AIMessage | null = null;
+    let accumulatedChunk: AIMessageChunk | null = null;
     let chunkCount = 0;
 
     console.log(`[LLMAgentExecutor] Processing Chat Completions streaming chunks...`);
@@ -174,24 +175,13 @@ class LLMAgentExecutor implements AgentExecutor {
       }
 
       chunkCount++;
-      const chunkText = chunk.content.toString();
+      const chunkMessage = chunk as AIMessageChunk;
+      const chunkText = chunkMessage.content?.toString() ?? "";
       accumulatedText += chunkText;
 
-      // Accumulate the full response
-      if (!accumulatedResponse) {
-        accumulatedResponse = chunk;
-      } else {
-        accumulatedResponse.content = accumulatedText;
-        if (chunk.response_metadata) {
-          accumulatedResponse.response_metadata = chunk.response_metadata;
-        }
-        if (chunk.tool_calls && chunk.tool_calls.length > 0) {
-          accumulatedResponse.tool_calls = [
-            ...(accumulatedResponse.tool_calls || []),
-            ...chunk.tool_calls
-          ];
-        }
-      }
+      accumulatedChunk = accumulatedChunk
+        ? accumulatedChunk.concat(chunkMessage)
+        : chunkMessage;
 
       // Send incremental update to client
       if (chunkText.trim()) {
@@ -209,22 +199,34 @@ class LLMAgentExecutor implements AgentExecutor {
         };
         eventBus.publish(artifactUpdate);
 
-        const preview = chunkText.length > 50 ? chunkText.substring(0, 50) + "..." : chunkText;
-        console.log(
-          `[LLMAgentExecutor] 📤 Sent artifact update #${chunkCount}: "${preview}" (artifact: ${artifactId.substring(0, 8)}...)`
-        );
+        // const preview = chunkText.length > 50 ? chunkText.substring(0, 50) + "..." : chunkText;
+        // console.log(
+        //   `[LLMAgentExecutor] 📤 Sent artifact update #${chunkCount}: "${preview}" (artifact: ${artifactId.substring(0, 8)}...)`
+        // );
 
-        if (chunkCount % 5 === 0) {
-          console.log(
-            `[LLMAgentExecutor] Streamed ${chunkCount} chunks, ${accumulatedText.length} chars so far...`
-          );
-        }
+        // if (chunkCount % 5 === 0) {
+        //   console.log(
+        //     `[LLMAgentExecutor] Streamed ${chunkCount} chunks, ${accumulatedText.length} chars so far...`
+        //   );
+        // }
       }
     }
 
     console.log(
       `[LLMAgentExecutor] Chat Completions streaming complete: ${chunkCount} chunks, ${accumulatedText.length} total chars`
     );
+
+    if (accumulatedChunk) {
+      accumulatedResponse = new AIMessage({
+        id: accumulatedChunk.id,
+        content: accumulatedChunk.content,
+        additional_kwargs: accumulatedChunk.additional_kwargs,
+        response_metadata: accumulatedChunk.response_metadata,
+        tool_calls: accumulatedChunk.tool_calls,
+        invalid_tool_calls: accumulatedChunk.invalid_tool_calls,
+        usage_metadata: accumulatedChunk.usage_metadata,
+      });
+    }
 
     return { text: accumulatedText, response: accumulatedResponse };
   }
